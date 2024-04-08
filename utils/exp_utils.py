@@ -51,7 +51,7 @@ def load_checkpoint(path):
 
 def save_checkpoint(args, model, model_config, optimizer, scheduler,
                     vocab, epoch, batch, last_iter, train_step, work_dir,
-                     scaler):
+                     scaler, optimizer_ar = None, scheduler_ar = None):
     state = {
         'args': args,
         'model_config': model_config,
@@ -64,6 +64,23 @@ def save_checkpoint(args, model, model_config, optimizer, scheduler,
         'batch': batch,
         'last_iter': last_iter,
         'train_step': train_step,
+        }
+    
+    if optimizer_ar:
+        state = {
+            'args': args,
+            'model_config': model_config,
+            'model_state': model.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'scheduler_state': scheduler.state_dict(),
+            'scaler': scaler.state_dict(),
+            'vocab': vocab,
+            'epoch': epoch,
+            'batch': batch,
+            'last_iter': last_iter,
+            'train_step': train_step,
+            'optimizer_ar_state': optimizer_ar.state_dict(),
+            'scheduler_ar_state': scheduler_ar.state_dict(),
         }
 
     last_chkpt_fname = 'checkpoint_last.pt'

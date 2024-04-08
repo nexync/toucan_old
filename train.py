@@ -240,7 +240,7 @@ def evaluate(eval_iter, model, args):
 
 
 def train_iteration(model, i, data_chunks, target_chunks, boundaries_chunks,
-                    args, scaler, replace_threshold = 0.5):
+                    args, scaler, replace_threshold = 0.5, loss_ar = False):
     data_i = data_chunks[i].contiguous()
     target_i = target_chunks[i].contiguous()
 
@@ -254,9 +254,12 @@ def train_iteration(model, i, data_chunks, target_chunks, boundaries_chunks,
         seq_loss, stats, aux_loss, _, _, token_loss = model(data_i, target_i, boundaries_i, replace_threshold=replace_threshold)
         #</CHANGE>
         seq_loss = seq_loss.float().mean().type_as(seq_loss)
-        if token_loss != 0:
-            token_loss = token_loss.float().mean().type_as(token_loss)
-        total_loss = (seq_loss + aux_loss + token_loss) / args.batch_chunk
+        token_loss = token_loss.float().mean().type_as(token_loss)
+        
+        if not loss_ar:
+            total_loss = (seq_loss + aux_loss) / args.batch_chunk
+        else:
+            total_loss = token_loss / args.batch_chunk
 
     if args.fp16:
         scaler.scale(total_loss).backward()
@@ -268,7 +271,7 @@ def train_iteration(model, i, data_chunks, target_chunks, boundaries_chunks,
 
 def train(tr_iter, va_iter, model, model_config, optimizer,
           scheduler, vocab, epoch, last_iter, train_step,
-          args, scaler):
+          args, scaler, optimizer_ar = None, scheduler_ar = None, opt_switch_freq = None, train_step_ar = None):
     model.train()
 
     train_loss = 0
@@ -282,8 +285,24 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
 
     train_iter = tr_iter.get_fixlen_iter(start=last_iter, shuffle=args.shuffle,
                                          seed=args.seed + epoch, nw=args.nw)
+    
+    curr_opt_index = 0
+    if opt_switch_freq:
+        opt_list = [optimizer, optimizer_ar]
+        sch_list = [scheduler, scheduler_ar]
+        step_list = [train_step, train_step_ar]
+    else:
+        opt_list = [optimizer]
+        sch_list = [scheduler]
+        step_list = [train_step, 0]
 
     for batch, (data, target, seq_len, boundaries) in enumerate(train_iter, start=1):
+        if opt_switch_freq:
+            if (batch % sum(opt_switch_freq)) < opt_switch_freq[0]:
+                curr_opt_index = 0
+            else:
+                curr_opt_index = 1
+
         # Prepare data
         data = data.to(tr_iter.device, non_blocking=True)
         data_chunks = torch.chunk(data, args.batch_chunk, 1)
@@ -311,12 +330,12 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
                 with model.no_sync():
                     train_loss_chunk, stats = train_iteration(
                         model, i, data_chunks, target_chunks,
-                        boundaries_chunks, args, scaler, replace_threshold = max(0., 0.5 - 0.005 * epoch)
+                        boundaries_chunks, args, scaler, replace_threshold = max(0., 0.5), loss_ar = bool(curr_opt_index)
                     )
             else:
                 train_loss_chunk, stats = train_iteration(
                     model, i, data_chunks, target_chunks, boundaries_chunks,
-                    args, scaler, replace_threshold = max(0., 0.5 - 0.005 * epoch)
+                    args, scaler, replace_threshold = max(0., 0.5), loss_ar = bool(curr_opt_index)
                 )
 
             train_loss += train_loss_chunk
@@ -326,7 +345,8 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
             stats_agg[k].append(v)
 
         if args.fp16:
-            scaler.unscale_(optimizer)
+            for opt in opt_list:
+                scaler.unscale_(opt)
 
         grad_l2 = (
             sum(p.grad.detach().data.norm(2).item() ** 2 for p in model.parameters())
@@ -341,23 +361,23 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
         if args.fp16:
-            scaler.step(optimizer)
+            scaler.step(opt_list[curr_opt_index])
             scaler.update()
         else:
-            optimizer.step()
+            opt_list[curr_opt_index].step()
 
         # step-wise learning rate annealing
-        train_step += 1
+        step_list[curr_opt_index] += 1
 
         # linear warmup stage
-        if train_step < args.warmup_step:
-            curr_lr = args.lr * train_step / args.warmup_step
-            optimizer.param_groups[0]['lr'] = curr_lr
+        if step_list[curr_opt_index] < args.warmup_step:
+            curr_lr = args.lr * step_list[curr_opt_index] / args.warmup_step
+            opt_list[curr_opt_index].param_groups[0]['lr'] = curr_lr
         else:
-            scheduler.step(train_step - args.warmup_step)
+            sch_list[curr_opt_index].step(step_list[curr_opt_index] - args.warmup_step)
 
         # logging
-        if train_step % args.log_interval == 0 or train_step == 1:
+        if sum(step_list) % args.log_interval == 0 or sum(step_list) == 1:
             cur_loss = train_loss / log_step
             cur_loss = utils.distributed.all_reduce_item(cur_loss, op='mean')
             train_loss = 0
@@ -372,10 +392,11 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
             target_tokens = 0
             log_start_time = time.time()
 
-            log_str = '| epoch {:3d} step {:>8d} | batches {:>6d} / {:d} | lr {:.3e} ' \
+            log_str = '| epoch {:3d} steps lm + boundary {:>8d} steps autoregressive {:>8d} | batches {:>6d} / {:d} | lr {:.3e} ' \
                 '| tok/s {:7.0f} | loss {:5.2f}'.format(
                     epoch,
-                    train_step,
+                    step_list[0],
+                    step_list[1],
                     batch,
                     tr_iter.n_batch,
                     lr,
@@ -385,8 +406,8 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
 
             print_once(log_str, args)
 
-        do_periodic_eval = train_step % args.eval_interval == 0
-        is_final_step = train_step == args.max_step
+        do_periodic_eval = sum(step_list) % args.eval_interval == 0
+        is_final_step = sum(step_list) == args.max_step
 
         if (do_periodic_eval or is_final_step):
             eval_start_time = time.time()
@@ -397,8 +418,8 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
             print_once('-' * 100, args)
             log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \
                       '| valid loss {:5.2f}'.format(
-                          train_step // args.eval_interval,
-                          train_step,
+                          sum(step_list) // args.eval_interval,
+                          sum(step_list),
                           (time.time() - eval_start_time),
                           val_loss,
                           )
@@ -409,13 +430,13 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
 
             save_checkpoint(args, model, model_config, optimizer, scheduler,
                             vocab, epoch, batch, last_iter,
-                            train_step, args.work_dir, scaler)
+                            sum(step_list), args.work_dir, scaler, optimizer_ar, scheduler_ar)
             log_start_time += time.time() - eval_start_time
 
         if is_final_step:
             break
-
-    return train_step
+    
+    return step_list
 
 
 def main():
@@ -489,11 +510,19 @@ def main():
                            betas=(args.adam_b1, args.adam_b2),
                            eps=args.adam_eps,
                            weight_decay=args.weight_decay)
+    
+    optimizer_ar = optim.Adam(model.layers[1].parameters(), lr=args.lr,
+                           betas=(args.adam_b1, args.adam_b2),
+                           eps=args.adam_eps,
+                           weight_decay=args.weight_decay)
 
     # Scheduler
     max_step = args.max_step
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, max_step - args.warmup_step, eta_min=0.0)
+    
+    scheduler_ar = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_ar, max_step - args.warmup_step, eta_min=0.0)
 
     # Model to GPU
     model = model.to(device)
@@ -528,11 +557,12 @@ def main():
     # Train
     ###########################################################################
     train_step = 0
+    train_step_ar = 0
     for epoch in itertools.count(start=1):
         if args.roll:
             tr_iter.roll(seed=args.seed + epoch)
 
-        train_step = train(
+        train_step, train_step_ar = train(
             tr_iter,
             va_iter,
             model,
@@ -545,6 +575,11 @@ def main():
             train_step=train_step,
             args=args,
             scaler=scaler,
+            # these default to none if not specified
+            optimizer_ar = optimizer_ar,
+            scheduler_ar = scheduler_ar,
+            opt_switch_freq = (10,10),
+            train_step_ar = train_step_ar,
         )
 
         if train_step == args.max_step:
