@@ -51,7 +51,7 @@ def load_checkpoint(path):
 
 def save_checkpoint(args, model, model_config, optimizer, scheduler,
                     vocab, epoch, batch, last_iter, train_step, work_dir,
-                     scaler, optimizer_ar = None, scheduler_ar = None):
+                     scaler, optimizer_ar = None, scheduler_ar = None, save_path = None):
     state = {
         'args': args,
         'model_config': model_config,
@@ -83,7 +83,10 @@ def save_checkpoint(args, model, model_config, optimizer, scheduler,
             'scheduler_ar_state': scheduler_ar.state_dict(),
         }
 
-    last_chkpt_fname = 'checkpoint_last.pt'
+    if not save_path:
+        last_chkpt_fname = 'checkpoint_boop.pt'
+    else:
+        last_chkpt_fname = save_path
 
     with utils.distributed.sync_workers() as rank:
         last_chkpt_path = os.path.join(work_dir, last_chkpt_fname)

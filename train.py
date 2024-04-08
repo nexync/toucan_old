@@ -428,9 +428,10 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
 
             last_iter = tr_iter.last_iter
 
+            save_path = "checkpoint_iterate.pt"
             save_checkpoint(args, model, model_config, optimizer, scheduler,
                             vocab, epoch, batch, last_iter,
-                            sum(step_list), args.work_dir, scaler, optimizer_ar, scheduler_ar)
+                            sum(step_list), args.work_dir, scaler, optimizer_ar, scheduler_ar, save_path)
             log_start_time += time.time() - eval_start_time
 
         if is_final_step:
