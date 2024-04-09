@@ -261,7 +261,7 @@ def train_iteration(model, i, data_chunks, target_chunks, boundaries_chunks,
         else:
             total_loss = token_loss / args.batch_chunk
 
-        total_loss += sum(p.detach().norm(2).item() for p in model.parameters()) * 0.
+        total_loss = total_loss + sum(p.sum() for p in model.parameters())
 
     if args.fp16:
         scaler.scale(total_loss).backward()
@@ -343,6 +343,8 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
                     args, scaler, replace_threshold = max(0., 0.5), loss_ar = bool(curr_opt_index)
                 )
 
+            print(train_loss_chunk)
+
             train_loss += train_loss_chunk
 
         # Custom stats from the model
@@ -352,8 +354,6 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
         if args.fp16:
             for opt in opt_list:
                 scaler.unscale_(opt)
-
-        print("MODEL_PARAMS: ", model.parameters())
 
         grad_l2 = (
             sum([p.grad.detach().data.norm(2).item() ** 2 if p.grad is not None else 0 for p in model.parameters()])
