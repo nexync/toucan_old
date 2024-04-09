@@ -630,7 +630,7 @@ class MemTransformerLM(nn.Module):
             if self.autoregressive:
                 loss_token = self.ar_loss(pre_token_model[1:].view(-1, pre_upsample.size(-1)), pre_upsample[:-1].view(-1, pre_upsample.size(-1)), torch.ones((pre_upsample.size(0)-1)*pre_upsample.size(1), dtype = pre_upsample.dtype, device = pre_upsample.device).detach())
             else:
-                loss_token = 0.
+                loss_token = torch.tensor(0., device = pre_upsample.device, dtype = pre_upsample.dtype, requires_grad = True)
             
             return loss, stats, loss_boundaries, logit, hard_boundaries[:, -tgt_len:], loss_token
         else:

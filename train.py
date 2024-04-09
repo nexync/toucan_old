@@ -288,6 +288,8 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
     
     curr_opt_index = 0
     if opt_switch_freq:
+        assert args.autoregressive
+
         opt_list = [optimizer, optimizer_ar]
         sch_list = [scheduler, scheduler_ar]
         step_list = [train_step, train_step_ar]
@@ -321,8 +323,9 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
         target_tokens += target.numel()
 
         # Optimizer zero grad
-        for param in model.parameters():
-            param.grad = None
+        # for param in model.parameters():
+        #     param.grad = None
+        opt_list[curr_opt_index].zero_grad()
 
         # Training on current batch
         for i in range(args.batch_chunk):
@@ -348,8 +351,10 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
             for opt in opt_list:
                 scaler.unscale_(opt)
 
+        print("MODEL_PARAMS: ", model.parameters())
+
         grad_l2 = (
-            sum(p.grad.detach().data.norm(2).item() ** 2 for p in model.parameters())
+            sum([p.grad.detach().data.norm(2).item() ** 2 if p.grad is not None else 0 for p in model.parameters()])
             ** 0.5
         )
         weights_l2 = (
@@ -507,15 +512,25 @@ def main():
     args.n_all_param = sum([p.nelement() for p in model.parameters()])
 
     # Optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.lr,
-                           betas=(args.adam_b1, args.adam_b2),
-                           eps=args.adam_eps,
-                           weight_decay=args.weight_decay)
+    # optimizer = optim.Adam(model.parameters(), lr=args.lr,
+    #                        betas=(args.adam_b1, args.adam_b2),
+    #                        eps=args.adam_eps,
+    #                        weight_decay=args.weight_decay)
+
+    optimizer = optim.Adam(
+        [p[1] for p in filter(lambda p: (p[0].split(".")[0] != "layers" or p[0].split(".")[1] != "1"), model.named_parameters())],  
+        lr=args.lr,
+        betas=(args.adam_b1, args.adam_b2),
+        eps=args.adam_eps,
+        weight_decay=args.weight_decay
+    )
     
-    optimizer_ar = optim.Adam(model.layers[1].parameters(), lr=args.lr,
-                           betas=(args.adam_b1, args.adam_b2),
-                           eps=args.adam_eps,
-                           weight_decay=args.weight_decay)
+    optimizer_ar = optim.Adam(model.layers[1].parameters(), 
+        lr=args.lr,
+        betas=(args.adam_b1, args.adam_b2),
+        eps=args.adam_eps,
+        weight_decay=args.weight_decay
+    )
 
     # Scheduler
     max_step = args.max_step

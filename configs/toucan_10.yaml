@@ -17,7 +17,7 @@ model: &model
    nw: 8
    fp16: true 
    add_eot: true
-   autoregressive: false
+   autoregressive: true
 
 boundaries: &boundaries
    boundaries_type: 'gumbel'
@@ -46,7 +46,7 @@ optim: &optim
 
 train: &train
    cuda: true
-   max_step: 200000
+   max_step: 300000
    tgt_len: 2048
    batch_size: 8
    batch_chunk: 1
