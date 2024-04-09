@@ -261,6 +261,8 @@ def train_iteration(model, i, data_chunks, target_chunks, boundaries_chunks,
         else:
             total_loss = token_loss / args.batch_chunk
 
+        total_loss += sum(p.detach().norm(2).item() for p in model.parameters()) * 0.
+
     if args.fp16:
         scaler.scale(total_loss).backward()
     else:
