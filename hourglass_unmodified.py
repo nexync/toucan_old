@@ -301,8 +301,6 @@ class MemTransformerLM(nn.Module):
         self.d_model = d_model
         self.n_head = n_head
         self.d_head = d_head
-
-        self.autoregressive = autoregressive
         
         # <CHANGE>
         n = n_token + 1 if self.add_eot else n_token
@@ -368,6 +366,7 @@ class MemTransformerLM(nn.Module):
                 self.spikes_left = spikes_left
         # <CHANGE>
         self.final_cast = nn.Linear(d_model, n)
+        self.autoregressive = autoregressive
         # </CHANGE>
         self.crit = torch.nn.CrossEntropyLoss(reduction='none')
         self.ar_loss = torch.nn.CosineEmbeddingLoss(reduction='none')
@@ -407,7 +406,7 @@ class MemTransformerLM(nn.Module):
                 data,
                 target,
                 boundaries_gt,
-                replace_threshold = 0):
+                replace_threshold = 0.5):
         """
             data: T x B
             target: T x B
@@ -460,7 +459,7 @@ class MemTransformerLM(nn.Module):
                     hidden=hidden,
                     null_group=self.null_group,
                 )
-
+            
                 hidden = self.down_ln(hidden)
 
                 pre_token_model = hidden
@@ -633,8 +632,6 @@ class MemTransformerLM(nn.Module):
                     pre_upsample[:-1].view(-1, pre_upsample.size(-1)), 
                     torch.ones((pre_upsample.size(0)-1)*pre_upsample.size(1), dtype = pre_upsample.dtype, device = pre_upsample.device).detach()
                 )
-            else:
-                loss_token = torch.tensor(0., device = pre_upsample.device, dtype = pre_upsample.dtype, requires_grad = True)
             
             return loss, stats, loss_boundaries, logit, hard_boundaries[:, -tgt_len:], loss_token
         else:
@@ -654,15 +651,15 @@ class MemTransformerLM(nn.Module):
                     logit, hard_boundaries, pre_upsample, last_hidden = self.forward(data, None, boundaries_gt)
                     logit = logit.squeeze()
                     out = [logit[-1].argmax().item()]
-
+          
                 # finished token, start a new one
                 if out[-1] == self.n_token:
                     count += 1
-
+                    
                     if count == num_tokens:
                         # data = torch.cat([data, torch.LongTensor(out[:-1]).to(data.device).unsqueeze(-1)], dim=0)
                         return data[orig_len:].squeeze()
-
+                    
                     # sample first character
                     char_vec = self.word_emb(torch.tensor([[out[-1]]], dtype=data.dtype, device=data.device))
                     new_vec = pre_upsample[-1].unsqueeze(0) + char_vec
@@ -670,13 +667,13 @@ class MemTransformerLM(nn.Module):
                     hidden = self._forward(core_input=last_hidden, layers = self.layers[-1])
                     logit = self.final_cast(hidden).squeeze()
                     out = [logit[-1].argmax().item()]
-
+                    
                     # reset pre_upsample
                     data = torch.cat([data, torch.LongTensor([out]).to(data.device)], dim=0)
                     logit, hard_boundaries, pre_upsample, last_hidden = self.forward(data, None, boundaries_gt)
                     logit = logit.squeeze()
                     out = [logit[-1].argmax().item()]
-
+                    
                 # continue rest of token
                 while out[-1] != self.n_token:
                     char_vec = self.word_emb(torch.tensor([[out[-1]]], dtype=data.dtype, device=data.device))
@@ -686,3 +683,4 @@ class MemTransformerLM(nn.Module):
                     logit = self.final_cast(hidden).squeeze()
                     out.append(logit[-1].argmax().item())
                 data = torch.cat([data, torch.LongTensor(out[:-1]).to(data.device).unsqueeze(-1)], dim=0)
+    #</ADDITION>

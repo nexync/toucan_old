@@ -213,13 +213,13 @@ def evaluate(eval_iter, model, args):
             for j in range(args.batch_chunk):
                 with torch.cuda.amp.autocast(args.fp16):
                     #<CHANGE>
-                    loss, stats, aux_loss, _, pred_boundaries, token_loss = model(
+                    loss, stats, aux_loss, _, pred_boundaries, _ = model(
                         data_chunks[j].contiguous(),
                         target_chunks[j].contiguous(),
                         boundaries_gt=boundaries_chunks[j].contiguous()
                         if boundaries_chunks is not None
                         else None,
-                        replace_threshold = 0.,
+                        replace_threshold = 0.
                     )
                     n_chars = loss.numel()
                     loss = loss.float().mean().type_as(loss)
@@ -240,8 +240,7 @@ def evaluate(eval_iter, model, args):
 
 
 def train_iteration(model, i, data_chunks, target_chunks, boundaries_chunks,
-                    args, scaler, replace_threshold = 0.5, loss_ar = False):
-
+                    args, scaler):
     data_i = data_chunks[i].contiguous()
     target_i = target_chunks[i].contiguous()
 
@@ -252,18 +251,12 @@ def train_iteration(model, i, data_chunks, target_chunks, boundaries_chunks,
 
     with torch.cuda.amp.autocast(args.fp16):
         #<CHANGE>
-        seq_loss, stats, aux_loss, _, _, token_loss = model(data_i, target_i, boundaries_i, replace_threshold=replace_threshold)
+        seq_loss, stats, aux_loss, _, _, token_loss = model(data_i, target_i, boundaries_i, replace_threshold = 0.5)
         #</CHANGE>
         seq_loss = seq_loss.float().mean().type_as(seq_loss)
         token_loss = token_loss.float().mean().type_as(token_loss)
         total_loss = (seq_loss + aux_loss + token_loss) / args.batch_chunk
 
-        # if not loss_ar:
-        #     total_loss = (seq_loss + aux_loss) / args.batch_chunk
-        # else:
-        #     total_loss = token_loss / args.batch_chunk
-        # total_loss = total_loss + sum(p.sum() for p in model.parameters()) * 0.
-    
     if args.fp16:
         scaler.scale(total_loss).backward()
     else:
@@ -274,7 +267,7 @@ def train_iteration(model, i, data_chunks, target_chunks, boundaries_chunks,
 
 def train(tr_iter, va_iter, model, model_config, optimizer,
           scheduler, vocab, epoch, last_iter, train_step,
-          args, scaler, optimizer_ar = None, scheduler_ar = None, opt_switch_freq = None, train_step_ar = None):
+          args, scaler):
     model.train()
 
     train_loss = 0
@@ -288,26 +281,12 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
 
     train_iter = tr_iter.get_fixlen_iter(start=last_iter, shuffle=args.shuffle,
                                          seed=args.seed + epoch, nw=args.nw)
-    
-    curr_opt_index = 0
-    if opt_switch_freq:
-        assert args.autoregressive
 
-        opt_list = [optimizer, optimizer_ar]
-        sch_list = [scheduler, scheduler_ar]
-        step_list = [train_step, train_step_ar]
-    else:
-        opt_list = [optimizer]
-        sch_list = [scheduler]
-        step_list = [train_step, 0]
+    # opt_list = [optimizer]
+    # sch_list = [scheduler]
+    # step_list = [train_step,0]
 
     for batch, (data, target, seq_len, boundaries) in enumerate(train_iter, start=1):
-        if opt_switch_freq:
-            if (batch % sum(opt_switch_freq)) > opt_switch_freq[0] or batch == sum(opt_switch_freq):
-                curr_opt_index = 1
-            else:
-                curr_opt_index = 0
-
         # Prepare data
         data = data.to(tr_iter.device, non_blocking=True)
         data_chunks = torch.chunk(data, args.batch_chunk, 1)
@@ -329,21 +308,18 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
         for param in model.parameters():
             param.grad = None
 
-        # for opt in opt_list:
-        #     opt.zero_grad()
-
         # Training on current batch
         for i in range(args.batch_chunk):
             if i < args.batch_chunk - 1 and isinstance(model, DistributedDataParallel):
                 with model.no_sync():
                     train_loss_chunk, stats = train_iteration(
                         model, i, data_chunks, target_chunks,
-                        boundaries_chunks, args, scaler, replace_threshold = 0, loss_ar = bool(curr_opt_index)
+                        boundaries_chunks, args, scaler
                     )
             else:
                 train_loss_chunk, stats = train_iteration(
                     model, i, data_chunks, target_chunks, boundaries_chunks,
-                    args, scaler, replace_threshold = 0, loss_ar = bool(curr_opt_index)
+                    args, scaler
                 )
 
             train_loss += train_loss_chunk
@@ -353,11 +329,10 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
             stats_agg[k].append(v)
 
         if args.fp16:
-            for opt in opt_list:
-                scaler.unscale_(opt)
+            scaler.unscale_(optimizer)
 
         grad_l2 = (
-            sum([p.grad.detach().data.norm(2).item() ** 2 if p.grad is not None else 0 for p in model.parameters()])
+            sum(p.grad.detach().data.norm(2).item() ** 2 for p in model.parameters())
             ** 0.5
         )
         weights_l2 = (
@@ -367,31 +342,25 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
         stats_agg['grad_l2'].append(grad_l2)
         stats_agg['weights_l2'].append(weights_l2)
 
-        # is_nan = torch.stack([torch.isnan(p).any() for p in model.parameters()]).any()
-        # print(batch, is_nan, train_loss_chunk)
-
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
         if args.fp16:
-            scaler.step(opt_list[curr_opt_index])
+            scaler.step(optimizer)
             scaler.update()
         else:
-            opt_list[curr_opt_index].step()
-
-        # is_nan = torch.stack([torch.isnan(p).any() for p in model.parameters()]).any()
-        # print(batch, is_nan, train_loss_chunk)
+            optimizer.step()
 
         # step-wise learning rate annealing
-        step_list[curr_opt_index] += 1
+        train_step += 1
 
         # linear warmup stage
-        if step_list[curr_opt_index] < args.warmup_step:
-            curr_lr = args.lr * step_list[curr_opt_index] / args.warmup_step
-            opt_list[curr_opt_index].param_groups[0]['lr'] = curr_lr
+        if train_step < args.warmup_step:
+            curr_lr = args.lr * train_step / args.warmup_step
+            optimizer.param_groups[0]['lr'] = curr_lr
         else:
-            sch_list[curr_opt_index].step(step_list[curr_opt_index] - args.warmup_step)
+            scheduler.step(train_step - args.warmup_step)
 
         # logging
-        if sum(step_list) % args.log_interval == 0 or sum(step_list) == 1:
+        if train_step % args.log_interval == 0 or train_step == 1:
             cur_loss = train_loss / log_step
             cur_loss = utils.distributed.all_reduce_item(cur_loss, op='mean')
             train_loss = 0
@@ -406,11 +375,10 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
             target_tokens = 0
             log_start_time = time.time()
 
-            log_str = '| epoch {:3d} steps lm + boundary {:>8d} steps autoregressive {:>8d} | batches {:>6d} / {:d} | lr {:.3e} ' \
+            log_str = '| epoch {:3d} step {:>8d} | batches {:>6d} / {:d} | lr {:.3e} ' \
                 '| tok/s {:7.0f} | loss {:5.2f}'.format(
                     epoch,
-                    step_list[0],
-                    step_list[1],
+                    train_step,
                     batch,
                     tr_iter.n_batch,
                     lr,
@@ -420,8 +388,8 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
 
             print_once(log_str, args)
 
-        do_periodic_eval = sum(step_list) % args.eval_interval == 0
-        is_final_step = sum(step_list) == args.max_step
+        do_periodic_eval = train_step % args.eval_interval == 0
+        is_final_step = train_step == args.max_step
 
         if (do_periodic_eval or is_final_step):
             eval_start_time = time.time()
@@ -432,8 +400,8 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
             print_once('-' * 100, args)
             log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \
                       '| valid loss {:5.2f}'.format(
-                          sum(step_list) // args.eval_interval,
-                          sum(step_list),
+                          train_step // args.eval_interval,
+                          train_step,
                           (time.time() - eval_start_time),
                           val_loss,
                           )
@@ -442,20 +410,20 @@ def train(tr_iter, va_iter, model, model_config, optimizer,
 
             last_iter = tr_iter.last_iter
 
-            save_path = "checkpoint_iterate_no_replace.pt"
             save_checkpoint(args, model, model_config, optimizer, scheduler,
                             vocab, epoch, batch, last_iter,
-                            sum(step_list), args.work_dir, scaler, optimizer_ar, scheduler_ar, save_path)
+                            train_step, args.work_dir, scaler, save_path = "checkpoint_fixed.pt")
             log_start_time += time.time() - eval_start_time
 
         if is_final_step:
             break
-    
-    return step_list
+
+    return train_step
 
 
 def main():
     torch.autograd.set_detect_anomaly(True)
+
     args = parse_args()
 
     # Initialize distributed backend
@@ -465,7 +433,7 @@ def main():
     with utils.distributed.sync_workers() as rank:
         if rank == 0:
             create_exp_dir(args.work_dir,
-                           scripts_to_save=['train.py', 'hourglass.py'],)
+                           scripts_to_save=['train_unmodified.py', 'hourglass.py'],)
 
     print_once(f'world size: {utils.distributed.get_world_size()}', args)
     init_seed(args.seed)
@@ -522,33 +490,15 @@ def main():
     args.n_all_param = sum([p.nelement() for p in model.parameters()])
 
     # Optimizer
-    # optimizer = optim.Adam(model.parameters(), lr=args.lr,
-    #                        betas=(args.adam_b1, args.adam_b2),
-    #                        eps=args.adam_eps,
-    #                        weight_decay=args.weight_decay)
-
-    optimizer = optim.Adam(
-        [p[1] for p in filter(lambda p: (p[0].split(".")[0] != "layers" or p[0].split(".")[1] != "1"), model.named_parameters())],  
-        lr=args.lr,
-        betas=(args.adam_b1, args.adam_b2),
-        eps=args.adam_eps,
-        weight_decay=args.weight_decay
-    )
-    
-    optimizer_ar = optim.Adam(model.layers[1].parameters(), 
-        lr=args.lr,
-        betas=(args.adam_b1, args.adam_b2),
-        eps=args.adam_eps,
-        weight_decay=args.weight_decay
-    )
+    optimizer = optim.Adam(model.parameters(), lr=args.lr,
+                           betas=(args.adam_b1, args.adam_b2),
+                           eps=args.adam_eps,
+                           weight_decay=args.weight_decay)
 
     # Scheduler
     max_step = args.max_step
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, max_step - args.warmup_step, eta_min=0.0)
-    
-    scheduler_ar = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_ar, max_step - args.warmup_step, eta_min=0.0)
 
     # Model to GPU
     model = model.to(device)
@@ -583,12 +533,11 @@ def main():
     # Train
     ###########################################################################
     train_step = 0
-    train_step_ar = 0
     for epoch in itertools.count(start=1):
         if args.roll:
             tr_iter.roll(seed=args.seed + epoch)
 
-        train_step, train_step_ar = train(
+        train_step = train(
             tr_iter,
             va_iter,
             model,
@@ -601,11 +550,6 @@ def main():
             train_step=train_step,
             args=args,
             scaler=scaler,
-            #these default to none if not specified
-            optimizer_ar = optimizer_ar,
-            scheduler_ar = scheduler_ar,
-            opt_switch_freq = (10,10),
-            train_step_ar = train_step_ar,
         )
 
         if train_step == args.max_step:

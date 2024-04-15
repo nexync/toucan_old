@@ -15,7 +15,7 @@ model: &model
    shuffle: true
    roll: true
    nw: 8
-   fp16: true 
+   fp16: false 
    add_eot: true
    autoregressive: true
 
@@ -36,7 +36,7 @@ eval: &eval
 optim: &optim
    optim: adam
    scheduler: cosine
-   lr: 0.00025
+   lr: 0.0002
    warmup_step: 4000
    clip: 0.25
    weight_decay: 0
